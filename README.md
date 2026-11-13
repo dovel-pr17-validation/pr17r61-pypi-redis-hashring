@@ -1,0 +1,333 @@
+# `redis-hashring`
+
+`redis-hashring` is a Python library that implements a consistent hash ring for
+building distributed applications. The hash ring is stored in Redis.
+
+## The problem
+
+Let's assume you're building a distributed application that's responsible for
+syncing accounts. Accounts are synced continuously, e.g. by keeping a
+connection open. Given the large amount of accounts, the application can't run
+in one process and has to be distributed and split up in multiple processes.
+Also, if one of the processes fails or crashes, other machines need to be able
+to take over accounts quickly. The load should be balanced equally between the
+machines.
+
+## The solution
+
+A solution to this problem is to use a consistent hash ring: Different Python
+instances ("nodes") are responsible for a different set of keys. In our account
+example, the account IDs could be used as keys. A consistent hash ring is a
+large (integer) space that wraps around to form a circle. Each node picks a few
+random points ("replicas") on the hash ring when starting. Keys are hashed and
+looked up on the hash ring: In order to find the node that's responsible for a
+given key, we move on the hash ring until we find the next smaller point that
+belongs to a replica. The reason for multiple replicas per node is to ensure
+better distribution of the keys amongst the nodes. It can also be used to give
+certain nodes more weight. The ring is automatically rebalanced when a node
+enters or leaves the ring: If a node crashes or shuts down, its replicas are
+removed from the ring.
+
+## How it works
+
+The ring is stored as a sorted set (ZSET) in Redis. Each replica is a member of
+the set, scored by it's expiration time. Each node needs to periodically
+refresh the score of its replicas to stay on the ring.
+
+The ring contains 2^32 points, and a replica is created by randomly placing a
+point on the ring. A replica of a node is responsible for the range of points
+from its randomly generated starting point until the starting point of the next
+node or replica.
+
+To check if a node is responsible for a given key, the key's position on the
+ring is determined by hashing the key using xxHash (CRC-32 is also supported
+for backwards-compatibility).
+
+For example, let's say there are two nodes, having one replica each. The first
+node is at 1 000 000 000 (1e9), the second at 2e9. In this case, the first node
+is responsible for the range [1e9, 2e9-1], the second node is responsible for
+[2e9, 2^32-1] and [0, 1e9-1], since the ring wraps. To check to which node the
+key *hello* belongs, we compute its hash, which is 4 211 111 929, and the value
+is therefore on the second node.
+
+To compute the point of a key without a node, call `ring_point()` on the hash
+algorithm, for example `HashAlgorithm.XXHASH.ring_point("hello")`.
+
+Since the node replica points are picked randomly, it is recommended to have
+multiple replicas of the node on a ring to ensure a more even distribution of
+the nodes.
+
+## Demo
+
+As an example, let's assume you have a process that is responsible for syncing
+accounts. In this example they are numbered from 0 to 99. Starting node 1 will
+assign all accounts to node 1, since it's the only node on the ring.
+
+We can see this by running the provided example script on node 1:
+
+```
+% python example.py
+INFO:root:PID 80721, 100 keys ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99])
+```
+
+We can print the ring for debugging and see all the nodes and replicas on the
+ring:
+
+```
+% python example.py --print
+Hash ring "ring" replicas:
+Start      Range  Delay   Node
+ 706234936  2.97%      0s mbp.local:80721:249d729d
+ 833679955  3.58%      0s mbp.local:80721:aa60d44c
+ 987624694 24.44%      0s mbp.local:80721:aa7d4433
+2037338983  3.41%      0s mbp.local:80721:e810d068
+2183761853  3.55%      0s mbp.local:80721:3917f572
+2336151471  2.82%      0s mbp.local:80721:e42b1b46
+2457297989  4.40%      0s mbp.local:80721:e6bd5726
+2646391033  4.37%      0s mbp.local:80721:6de2fc22
+2834073726  5.30%      0s mbp.local:80721:b6f950b2
+3061910569  3.96%      0s mbp.local:80721:d176c9e2
+3231812046  5.70%      0s mbp.local:80721:65432143
+3476455773  5.71%      0s mbp.local:80721:f2b29682
+3721589736  0.65%      0s mbp.local:80721:51d0cb09
+3749333446  5.53%      0s mbp.local:80721:3572f718
+3986767934  4.39%      0s mbp.local:80721:42147f45
+4175523935 19.22%      0s mbp.local:80721:296c9522
+
+Hash ring "ring" nodes:
+Range    Replicas Delay   Hostname             PID
+100.00%       16      0s mbp.local            80721
+```
+
+We can see that the node is responsible for the entire ring (range 100%) and
+has 16 replicas on the ring.
+
+Now let's start another node by running the script again. It will add its
+replicas to the ring and notify all the remaining nodes.
+
+```
+% python example.py
+INFO:root:PID 80721, 51 keys ([1, 5, 8, 9, 10, 14, 17, 20, 21, 24, 25, 28, 30, 32, 33, 34, 36, 38, 41, 42, 45, 46, 49, 50, 52, 54, 56, 58, 59, 60, 61, 62, 65, 66, 68, 69, 71, 74, 75, 78, 79, 81, 82, 85, 86, 87, 88, 89, 92, 93, 96])
+```
+
+Node 1 will rebalance and is now only responsible for keys not in node 2:
+
+```
+INFO:root:PID 80808, 49 keys ([0, 2, 3, 4, 6, 7, 11, 12, 13, 15, 16, 18, 19, 22, 23, 26, 27, 29, 31, 35, 37, 39, 40, 43, 44, 47, 48, 51, 53, 55, 57, 63, 64, 67, 70, 72, 73, 76, 77, 80, 83, 84, 90, 91, 94, 95, 97, 98, 99])
+```
+
+We can inspect the ring:
+
+```
+% python example.py --print
+Hash ring "ring" replicas:
+Start      Range  Delay   Node
+ 204632062  1.06%      0s mbp.local:80808:f933c33c
+ 250215779  0.36%      0s mbp.local:80808:3b104c45
+ 265648189  1.15%      0s mbp.local:80808:84d71125
+ 315059885  2.77%      0s mbp.local:80808:bab5a03c
+ 434081415  6.34%      0s mbp.local:80808:6eec1b26
+ 706234936  2.97%      0s mbp.local:80721:249d729d
+ 833679955  1.59%      0s mbp.local:80721:aa60d44c
+ 901926411  2.00%      0s mbp.local:80808:bd6f3b27
+ 987624694  2.87%      0s mbp.local:80721:aa7d4433
+1110943067  5.42%      0s mbp.local:80808:abfa5d78
+1343923832  0.83%      0s mbp.local:80808:5261947f
+1379658747  4.70%      0s mbp.local:80808:cb0904de
+1581392642  1.06%      0s mbp.local:80808:3050daa3
+1627017290  9.55%      0s mbp.local:80808:8e1cef12
+2037338983  3.41%      0s mbp.local:80721:e810d068
+2183761853  3.55%      0s mbp.local:80721:3917f572
+2336151471  2.82%      0s mbp.local:80721:e42b1b46
+2457297989  4.40%      0s mbp.local:80721:e6bd5726
+2646391033  4.37%      0s mbp.local:80721:6de2fc22
+2834073726  2.30%      0s mbp.local:80721:b6f950b2
+2932842903  3.01%      0s mbp.local:80808:58f09769
+3061910569  3.08%      0s mbp.local:80721:d176c9e2
+3194206736  0.88%      0s mbp.local:80808:ce94a1cf
+3231812046  5.70%      0s mbp.local:80721:65432143
+3476455773  0.21%      0s mbp.local:80721:f2b29682
+3485592199  5.49%      0s mbp.local:80808:6fc107a3
+3721589736  0.65%      0s mbp.local:80721:51d0cb09
+3749333446  0.68%      0s mbp.local:80721:3572f718
+3778349273  4.85%      0s mbp.local:80808:e7cc7485
+3986767934  1.29%      0s mbp.local:80721:42147f45
+4042192844  3.10%      0s mbp.local:80808:001590b5
+4175523935  7.55%      0s mbp.local:80721:296c9522
+
+Hash ring "ring" nodes:
+Range    Replicas Delay   Hostname             PID
+47.42%       16      0s mbp.local            80721
+52.58%       16      0s mbp.local            80808
+```
+
+## Usage example
+
+`RingNode.start()` starts a daemon thread. The thread keeps the node in the
+ring, and updates the ranges of the node when the ring changes.
+`RingNode.stop()` stops the thread and removes the node from the ring.
+
+This example app processes only the items that the node owns:
+
+```python
+from redis import Redis
+from redis_hashring import RingNode
+
+KEY = "example-ring"
+
+redis = Redis()
+node = RingNode(redis, KEY)
+node.start()
+
+
+def get_items():
+    """
+    Implement this method and return items to be processed.
+    """
+    raise NotImplementedError()
+
+
+def process_items(items):
+    """
+    Implement this method and process the given items.
+    """
+    raise NotImplementedError()
+
+
+try:
+    while True:
+        # Only process items this node is responsible for.
+        items = [item for item in get_items() if node.contains(item)]
+        process_items(items)
+except KeyboardInterrupt:
+    pass
+
+node.stop()
+```
+
+## Implementation considerations
+
+When implementing a distributed application using `redis-hashring`, be aware of
+the following:
+
+- Locking
+
+  When nodes are added to the ring, multiple nodes might assume they're
+  responsible for the same key until they are notified about the new state of
+  the ring. Depending on the application, locking may be necessary to avoid
+  duplicate processing.
+
+  For example, in the demo above the node could add a per-account-ID lock if an
+  account should never be synced by multiple nodes at the same time. This can
+  be done using a Redis lock class or any other distributed lock.
+
+- Limit
+
+  It is recommended to add an upper limit to the number of keys a node can
+  process to avoid overloading a node when there are few nodes on the ring or
+  all nodes need to be restarted.
+
+  For example, in the demo above we could implement a limit of 50 accounts, if
+  we know that a node may not be capable of syncing much more. In this case,
+  multiple nodes would need to be running to sync all the accounts. Also note
+  that the ring is not usually equally balanced, so running 2 nodes wouldn't be
+  enough in this example.
+
+- Startup and shutdown
+
+  `RingNode.start()` returns when the node is in the ring and has its ranges.
+  Thus, `contains()` gives correct results right after `start()`.
+
+  If the node cannot join the ring, `start()` raises an error. For example,
+  this happens when Redis is not available. Before it raises, `start()` tries
+  to remove the replicas that the node added to the ring, if any.
+
+  If the removal also fails, the replicas stay in the ring. The other nodes
+  can count these replicas, and then no node owns the ranges of the replicas.
+  A replica expires 60 seconds after its last heartbeat, but the other nodes
+  see the expiry only when they read the ring. Each active node reads the
+  ring after each heartbeat, every 10 seconds. Thus, the ranges can stay
+  without an owner for up to about 70 seconds after the last heartbeat.
+
+  If the node already started, `start()` raises `RuntimeError`. After
+  `stop()`, or after a `start()` call that cannot join the ring, the node can
+  start again.
+
+  Only one `start()` or `stop()` call on a node can run at a time. If another
+  call on the same node is in progress, both methods raise `RuntimeError`.
+  They do not wait for the other call. Thus, a signal handler that calls
+  `stop()` during `start()` on the same thread gets an error, not a deadlock.
+
+  If something interrupts `start()`, the thread continues and can join the
+  ring. Examples are `KeyboardInterrupt` and the error of a `stop()` call from
+  a signal handler. Until a call to `stop()`, the node can stay in the ring,
+  and `start()` raises `RuntimeError`. The `with` statement does not call
+  `stop()` in this case, because Python calls `__exit__` only after
+  `__enter__` returns.
+
+  `start()` waits up to 10 seconds for Redis to confirm the subscription to
+  the channel of the ring. If no reply arrives, `start()` raises
+  `redis.exceptions.TimeoutError`.
+
+  The thread checks for a request to stop at least once per second. Thus,
+  `stop()` takes up to 1 second, plus the time of the Redis calls that the
+  thread runs before the check. After a Redis error, these calls include a new
+  subscription, which can wait up to 10 seconds for its confirmation.
+
+  For the other Redis calls, `start()` and `stop()` have no timeout of their
+  own. `start()` waits for the node to join the ring. `stop()` waits for the
+  Redis calls that the thread runs, if any. The socket timeouts of the Redis
+  client limit these waits. Without socket timeouts, both methods can wait
+  forever if Redis does not respond.
+
+- Redis errors
+
+  After `start()` returns, the node tries again after each error, until
+  `stop()`. Before each new attempt, the node waits for a random time. The
+  longest wait is 1 second after the first error. It doubles after each
+  failed attempt, up to 10 seconds.
+
+  The node logs each failed attempt with the logger `redis_hashring`, at the
+  level `WARNING`, with the traceback. Without a logging configuration,
+  Python prints records at the level `WARNING` and higher to stderr.
+
+  The node reads the ring after each heartbeat, every 10 seconds. Thus, if the
+  node misses a notice of a change of the ring, it sees the change within 10
+  seconds.
+
+  If the node cannot send a heartbeat and then read the ring for 50 seconds,
+  it gives up its keys. Then `contains()` returns `False` for all keys,
+  `get_ranges()` returns an empty tuple, and `get_node_count()` returns 0.
+  The other nodes see the node as dead after 60 seconds, so the node gives up
+  its keys first. Each heartbeat stores the time on the clock of the node, and
+  the other nodes compare it with their own clocks. Thus, the node gives up its
+  keys first only if the clocks of the hosts differ by less than 10 seconds. If
+  the clocks differ by more, two nodes can own the same keys at the same time.
+
+  These three methods compare the current time with the 50-second deadline
+  at each call. Thus, the node gives up its keys on time, even if a Redis call
+  of the thread blocks.
+
+  After a failed read of the ring, the node sends no heartbeat until a read
+  works again. Otherwise, the heartbeats keep the node alive for the other
+  nodes, and no node owns its keys. Thus, if the node can send heartbeats but
+  cannot read the ring, the other nodes see it as dead 60 seconds after its
+  last heartbeat. They take over its keys at their next read of the ring,
+  within 10 more seconds.
+
+  When Redis is available again, the node joins the ring again and gets its
+  keys back. If the node had no successful heartbeat for 50 seconds, it
+  notifies the other nodes after the next heartbeat. Then they read the ring
+  and give the keys back.
+
+  The node logs one record at the level `ERROR` when it observes that its
+  ownership deadline has passed, and one at the level `INFO` when a renewal
+  restores ownership validity. Failed attempts continue to log at `WARNING`.
+  The expiry record includes the delay since the deadline, and the traceback
+  if it is observed while handling a failed attempt.
+
+  These observations happen after failed attempts and retry waits, and
+  before and after a renewal advances the deadline. If a Redis call blocks,
+  logging waits for the call to return; the ownership checks still enforce
+  the deadline while the thread is blocked. Errors in application log
+  handlers do not stop the node.
